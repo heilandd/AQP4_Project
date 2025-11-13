@@ -32,15 +32,8 @@ AQP4_singlecell_project/
 │  └─ singlecell_utils.R          # Single-cell specific helpers (Azimuth, etc.)
 ├─ python/
 │  └─ singlecell_attention.py     # Attention-based perturbation model
-├─ data/
-│  ├─ integrated_data_new.h5ad        # integrated AnnData (not included)
-│  ├─ azimuth_core_GBmap.rds          # Azimuth reference (not included)
-│  ├─ colors_cell_deconv.RDS          # reference colors (optional)
-│  ├─ GBM_Neuron_colors.RDS           # reference colors for GBM neurons
-│  └─ singlecell_raw/
-│      ├─ AQP4KO/                     # 10x folders for KO samples
-│      └─ AQP4WT/                     # 10x folders for WT samples
-└─ results/                           # Not included
+├─ data/                          # Not included    
+└─ results/                       # Not included
 
 ```
 
