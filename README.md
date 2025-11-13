@@ -1,7 +1,7 @@
 # AQP4 Single-cell Analysis
 
 This repository contains a reproducible version of the AQP4 single-cell RNA-seq
-analysis pipeline, cleaned from personal paths and system-specific settings.
+and spatial transcriptomics analysis pipeline.
 
 ## Structure
 
