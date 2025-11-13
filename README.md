@@ -9,12 +9,7 @@ and spatial transcriptomics analysis pipeline.
 
 
 AQP4_spatial_project/
-├─ data/
-│  ├─ file_system.RDS
-│  ├─ astro_signature.csv
-│  ├─ colors_celltypes.RDS
-│  ├─ VAE_ep200_fullData.h5ad
-│  └─ VAE_ep250_fullData/
+├─ data/                     #No Data incuded
 ├─ r/
 │  ├─ setup_spatial_project.R
 │  ├─ plotting_utils.R
