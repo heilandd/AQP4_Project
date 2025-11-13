@@ -1,0 +1,459 @@
+---
+title: "Spatial Analysis AQP4"
+output: pdf_document
+date: "2025-05-10"
+editor_options: 
+  chunk_output_type: console
+---
+
+Spatial transcriptomic analysis of AQP4 wildtype (WT) and knockout (KO) tumors.
+This script demonstrates the analysis pipeline, from loading SPATA objects
+to graph-based deep learning and ecosystem characterization.
+
+```{r setup, message=FALSE, warning=FALSE}
+# reticulate::use_condaenv("EcoFoundationV2") # optional
+
+library(DeepSPATA)
+library(SPATA2)
+library(Seurat)
+library(reticulate)
+library(tidyverse)
+library(igraph)
+library(kableExtra)
+library(readxl)
+library(anndata)
+
+source("r/setup_spatial_project.R")
+source("r/plotting_utils.R")
+source("r/astro_signature_utils.R")
+source("r/segmentation_utils.R")
+source("r/ecosystem_utils.R")
+
+py_config()  # optional
+```
+
+## Set up file system
+
+```{r}
+project_root <- get_project_root()
+file_system <- readRDS(file.path(project_root, "data", "file_system.RDS"))
+str(file_system)
+```
+
+## Spatial overview of SPATA objects
+
+```{r}
+spata_obj_1 <- readRDS(file_system$SPATA[1])
+spata_obj_2 <- readRDS(file_system$SPATA[2])
+
+plot_spatial_overview(spata_obj_1)
+plot_spatial_overview(spata_obj_2)
+```
+
+## scVI normalization (Python)
+
+```{python}
+import scvi
+import scanpy as sc
+import anndata as ad
+import numpy as np
+import pandas as pd
+import torch.serialization as ts
+
+ts.add_safe_globals([np.core.multiarray._reconstruct])
+
+from rpy2.robjects import r
+
+file_system = r['file_system']
+adata_files = list(file_system.rx2("adata"))
+status      = list(file_system.rx2("status"))
+
+t = pd.Series(status)
+t_cat = pd.Categorical(t)
+status_num = t_cat.codes
+
+adata = ad.read_h5ad(adata_files[3])
+
+scvi.model.SCVI.setup_anndata(adata)
+model = scvi.model.SCVI(adata, n_latent=50)
+model.train(accelerator="auto", max_epochs=200, early_stopping=True)
+
+adata.obsm["X_scVI"] = model.get_latent_representation(adata)
+adata.layers["X_exp"] = model.get_normalized_expression(adata)
+
+adata.write_h5ad(adata_files[3])
+```
+
+## Astrocyte signature mapping and Aqp4 visualization
+
+```{r}
+AstroSig <- load_mouse_astro_signature(
+  path = file.path(project_root, "data", "astro_signature.csv")
+)
+
+spata_obj <- readRDS(file_system$SPATA[4])
+spata_obj@used_genesets <- dplyr::bind_rows(spata_obj@used_genesets, AstroSig)
+
+norm_expr <- t(py$adata$layers["X_exp"])
+spata_obj <- addExpressionMatrix(spata_obj, expr_mtr = norm_expr, mtr_name = "scVI")
+spata_obj <- SPATA2::setActiveExpressionMatrix(spata_obj, "scVI")
+
+plot_gene_spatial(spata_obj, gene = "Aqp4", limits = c(0, 0.4))
+```
+
+## Add spatial segmentation
+
+```{r}
+spata_obj_list <- lapply(file_system$SPATA, readRDS)
+spata_obj_list <- lapply(spata_obj_list, add_spatial_segmentation)
+purrr::walk2(spata_obj_list, file_system$SPATA, ~ saveRDS(.x, .y))
+```
+
+## Single-cell Voronoi map
+
+```{r}
+library(ggforce)
+
+spata_obj <- readRDS(file_system$SPATA[1])
+cell_types <- spata_obj@spatial[[1]]$cytospace
+
+celltype_colors <- readRDS(file.path(project_root, "data", "colors_celltypes.RDS"))
+cc <- celltype_colors$colors
+names(cc) <- celltype_colors$celtype_level2
+
+plot_single_cell_voronoi(spata_obj, cell_types, cc)
+```
+
+## GNN training (Python)
+
+```{python}
+import torch
+from torch_geometric.loader import DataLoader
+from torch.utils.data import random_split
+import numpy as np
+from rpy2.robjects import r
+
+from python.gnn_models import GraphMERFISHRegress
+from python.gnn_training import train_regressor
+
+project_root = r['project_root'][0]
+file_system  = r['file_system']
+
+sub = torch.load(f"{project_root}/data/subgraphs.pt", weights_only=False)
+num_features_exp = sub[1].x.shape[1]
+hidden_channels = 125
+num_classes_task1 = 2
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = GraphMERFISHRegress(
+    in_feat=num_features_exp,
+    hidden=hidden_channels,
+    num_classes_task1=num_classes_task1,
+    edge_dim=1
+).to(device)
+
+optimizer = torch.optim.Adam(
+    [
+        {"params": model.encoder.parameters()},
+        {"params": model.head.parameters(), "lr": 2e-4},
+    ],
+    lr=1e-3,
+    weight_decay=1e-4,
+)
+
+criterion1 = torch.nn.HuberLoss(delta=1.0)
+criterion2 = torch.nn.CrossEntropyLoss()
+
+data_list = sub
+train_ratio = 0.8
+train_size = int(len(data_list) * train_ratio)
+val_size   = len(data_list) - train_size
+train_data, val_data = random_split(data_list, [train_size, val_size])
+
+train_loader = DataLoader(train_data, batch_size=10, shuffle=False)
+val_loader   = DataLoader(val_data, batch_size=10, shuffle=False)
+
+model, loss_train, loss_val = train_regressor(
+    model,
+    train_loader,
+    val_loader,
+    optimizer=optimizer,
+    criterion1=criterion1,
+    criterion2=criterion2,
+    num_epochs=200,
+    patience=30,
+    checkpoint_path=f"{project_root}/data/checkpoint.pt",
+)
+
+torch.save(model.state_dict(), f"{project_root}/data/GNN_trained_AQP4_regression.pt")
+```
+
+## Evaluation and export to R
+
+```{python}
+from python.evaluation_utils import evaluate_classifier_and_regressor
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+full_loader = DataLoader(sub, batch_size=10, shuffle=False)
+eval_results = evaluate_classifier_and_regressor(model, full_loader, device=device)
+
+pred_1_all  = eval_results["pred_labels"]
+label_1_all = eval_results["true_labels"]
+logits_1_all = eval_results["logits"]
+region       = eval_results["region_pred"]
+region_gt    = eval_results["region_true"]
+```
+
+```{r}
+res <- data.frame(
+  status    = py$pred_1_all,
+  logit     = py$logits_1_all,
+  region    = py$region,
+  region_gt = py$region_gt
+)
+
+saveRDS(res, file.path(project_root, "data", "prediction_res.RDS"))
+
+plot_prediction_scatter(res)
+plot_prediction_rank(res)
+```
+
+
+## PseudoBulk Analysis:
+
+Run evaluation:
+```{python}
+import scvi
+import numpy as np
+adata_combined = sc.read_h5ad(f"{r.root}/VAE_ep200_fullData.h5ad")
+reference_model=scvi.model.SCVI.load(f"{r.root}/VAE_ep250_fullData",adata_combined)
+
+#full_data = DataLoader(sub, batch_size=10, shuffle=False)
+model.eval()
+val_outputs_1 = []
+val_labels1 = []
+logit1 = []
+bcs_subgraph = []
+
+with torch.no_grad():
+  for i, data in enumerate(sub):
+    data.edge_attr = data.distance.view(-1, 1).float()
+    node_latent, task1_out,_, att1, att2 = model(data.to(device))
+    logit1.append(task1_out.detach().cpu().numpy())
+    val_outputs_1.append(torch.argmax(task1_out, dim=1).detach().cpu().numpy())
+    pred_1 = data.status.long().to(device)
+    val_labels1.append(pred_1.cpu().numpy())
+    pat = data.patient_source.detach().cpu().numpy()
+    adata_eval = adata_combined[adata_combined.obs['batch'] == pat.item()].copy()
+    bcs_subgraph.append(adata_eval.obs.index[data.node_index].values)
+
+label_1_all = np.hstack(val_labels1)
+logits_1_all = np.concatenate(logit1)
+
+
+len(logits_1_all)
+
+```
+
+
+```{r}
+res = 
+  data.frame(subgraph_nr = 1:length(py$label_1_all), status = py$label_1_all, logit = py$logits_1_all) %>% 
+  mutate(KO = logit.1)
+
+subgraph_nodes <- map(py$bcs_subgraph,~ list(bcs =.x %>% str_split(., "_") %>% map(.,~.x[[1]]) %>% unlist(),
+                                             sample = .x %>% str_split(., "_") %>% map(.,~paste0(.x[[2]], "_",.x[[3]]) ) %>% unlist()
+                                             ))
+length(subgraph_nodes)
+subgraph_nodes[[700]]
+spata_obj <- map(1:4, ~readRDS(file_system$SPATA[.x]))
+names(spata_obj) <- paste0(file_system$samples, "-", 0:3)
+
+## Summarize the reads
+
+counts <- 
+  map(.x = 1:length(subgraph_nodes), 
+          .f =function(i){
+    nodes_target <- subgraph_nodes[[i]][[1]]
+    sample_target <- subgraph_nodes[[i]][[2]] 
+    s <- which(names(spata_obj)==c(sample_target %>% unique()))
+    mat = SPATA2::getCountMatrix(spata_obj[[s]])
+    barcodes_target = intersect(colnames(mat), nodes_target)
+    
+    sumreads <-
+        mat[,barcodes_target] %>% 
+        rowSums() %>% 
+        as.data.frame()
+    names(sumreads) <- paste0("Ecosystem_", i)
+    return(sumreads)
+}, .progress=T)
+
+## Transfer in common gene space
+common_elems <- Reduce(intersect, map(counts,~rownames(.x)))
+counts <- map_dfc(counts, ~.x[common_elems, ] %>% as.data.frame())
+rownames(counts) <- common_elems;names(counts) <- paste0("Ecosystem_", 1:length(subgraph_nodes))
+dim(counts)
+
+## Seurat:
+## Process Data:
+seurat <- Seurat::CreateSeuratObject(counts%>% as.matrix())
+
+seurat <- 
+  seurat %>% 
+  Seurat::FindVariableFeatures() %>% 
+  Seurat::NormalizeData() %>% 
+  Seurat::ScaleData()
+seurat$group = if_else(res$status==1, "KO", "WT")
+
+
+
+## DE:
+Idents(seurat) <- 'group'
+markers <- Seurat::FindAllMarkers(seurat)
+
+## GSEA:
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+
+marker_GSEA <- markers %>% filter(cluster=="KO") %>% arrange(desc(avg_log2FC))
+
+
+## Performe GSEA
+out_kME <- data.frame(SYMBOL = marker_GSEA$gene,
+                      kME = marker_GSEA$avg_log2FC)
+
+out_genes <- bitr(out_kME$SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Mm.eg.db")
+out_kME <- left_join(out_kME,out_genes)
+out_kME <- out_kME %>% filter(!is.na(ENTREZID)) %>% arrange(desc(kME))
+values = out_kME$kME;names(values) <- out_kME$ENTREZID
+GSEA <- clusterProfiler::gseGO(values,ont="ALL", keyType = "ENTREZID",OrgDb = "org.Mm.eg.db")
+KEEG <- clusterProfiler::gseKEGG(values, organism="mmu")
+
+GSEA@result %>% 
+  arrange(desc(enrichmentScore)) %>% 
+  head(20) %>%
+  arrange((enrichmentScore)) %>% 
+  select(Description, enrichmentScore, p.adjust) %>% 
+  mutate(Description = Description %>% str_replace_all("-", "_")) %>% 
+  mutate(Description = factor(Description, levels=Description)) %>% 
+  ggplot()+
+  geom_point(mapping=aes(x=enrichmentScore, y=Description, size=-log(p.adjust), fill=enrichmentScore), shape=21)+
+  scale_fill_gradientn(colors=viridis::inferno(50))+
+  guides(fill = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  xlab("")+ylab("")+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.25),
+          axis.text.x = element_text(colour="black",
+                                     angle = 90, vjust = 0.5, hjust=1), 
+          axis.text.y = element_text(colour="black"))
+
+
+KEEG@result %>% 
+  arrange(desc(enrichmentScore)) %>% 
+  head(20) %>%
+  arrange((enrichmentScore)) %>% 
+  select(Description, enrichmentScore, p.adjust) %>% 
+  mutate(Description = factor(Description, levels=Description)) %>% 
+  ggplot()+
+  geom_point(mapping=aes(x=enrichmentScore, y=Description, size=-log(p.adjust), fill=enrichmentScore), shape=21)+
+  scale_fill_gradientn(colors=viridis::inferno(50))+
+  guides(fill = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  xlab("")+ylab("")+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.25),
+          axis.text.x = element_text(colour="black",
+                                     angle = 90, vjust = 0.5, hjust=1), 
+          axis.text.y = element_text(colour="black"))
+
+```
+
+## Investigate the Astrocytic and Pericyte envirnments with KO vs WT
+```{r}
+
+
+edges_all <- 
+  map(.x = 1:length(subgraph_nodes), 
+          .f =function(i){
+    nodes_target <- subgraph_nodes[[i]][[1]]
+    sample_target <- subgraph_nodes[[i]][[2]] 
+    s <- which(names(spata_obj)==c(sample_target %>% unique()))
+    celltypes <- spata_obj[[s]]@spatial[[1]]$cytospace
+    target_cells <- celltypes %>% filter(barcodes %in% nodes_target) %>% filter(CellType=="Astrocytes") %>% pull(UniqueCID)
+    
+    if(length(target_cells)==0){
+      edges=data.frame(from=NA, to=NA, subgraph = i)
+    }else{
+      ## get KNN of all
+    library(FNN)
+    nn <- get.knnx(data = celltypes[!celltypes$UniqueCID %in% target_cells ,c("x_sc", "y_sc")],
+               query = celltypes[celltypes$UniqueCID %in% target_cells ,c("x_sc", "y_sc")],   
+               k = 10)
+    edges <- map_dfr(1:length(target_cells), .f=function(i){
+      edges = data.frame(from=target_cells[i], to=celltypes$UniqueCID[nn$nn.index[i,]])
+      edges$from <- left_join(data.frame(UniqueCID=edges$from), celltypes %>% select(UniqueCID, CellType)) %>% pull(CellType)
+      edges$to <- left_join(data.frame(UniqueCID=edges$to), celltypes %>% select(UniqueCID, CellType)) %>% pull(CellType)
+      
+      return(edges)
+    })
+    edges$subgraph = i
+    }
+    
+    
+    
+    return(edges)
+    
+}, .progress=T)
+
+## Add subgraph importance
+edges_all_df <- map_dfr(1:length(edges_all), ~edges_all[[.x]] %>% mutate(score = res$KO[.x],group = if_else(res$status==1, "KO", "WT")[.x]))
+
+edges_all_df_sum <- 
+  edges_all_df %>% 
+  filter(!is.na(from)) %>% 
+  filter(group=="KO") %>% 
+  group_by(from,to) %>% 
+  summarise(weight=length(to), mean_score = mean(score)) %>% 
+  ungroup() %>% 
+  mutate(weight = weight*mean_score)
+
+
+df_net <- edges_all_df_sum[,c("from", "to", "weight")]
+#df_net <- df_net %>% filter(weight>1000)
+dim(df_net)
+#df$weight <- scales::rescale(df$weight, c(0,1))
+df_net$weight <- df_net$weight^10
+graph <- igraph::graph_from_data_frame(df_net, directed=T)
+E(graph)$magnitude <- df_net$weight
+E(graph)$color <- df_net$to %>% as.character()
+type <- c(df_net$from, df_net$to %>% as.character()) %>% unique()
+V(graph)$type <- type 
+
+V(graph)$type
+library(ggraph)
+library(ggrepel)
+ggraph(graph, layout = 'linear', circular = TRUE)+
+  geom_edge_arc2(aes(width=magnitude, alpha=magnitude, edge_color = color))+
+  geom_node_point(aes(color=type), size=8)+
+  coord_fixed()+
+  theme_classic()+
+  scale_color_manual(values=cc)+
+  scale_edge_color_manual(values=cc)+
+  geom_text_repel(aes(x=x, y=y,label=type %>% str_replace_all(., "[.]", " ")), size=3)
+  #Seurat::NoLegend()
+
+
+```
+
+
+
+
+
+
+
+

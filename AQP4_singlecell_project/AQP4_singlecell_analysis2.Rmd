@@ -1,0 +1,812 @@
+---
+title: "Myeloid/Astrocytes"
+output: html_document
+date: "2025-11-13"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Use dedicated conda env for single-cell analysis if desired
+# reticulate::use_condaenv("Single_cell")
+
+library(SPATA2)
+library(Seurat)
+library(tidyverse)
+library(readxl)
+library(reticulate)
+
+source("r/setup_spatial_project.R")
+source("r/plotting_utils.R")
+source("r/singlecell_utils.R")
+
+project_root <- get_project_root()
+pycolors <- importPyColors()  # defined in singlecell_utils.R
+```
+
+
+-> This script uses the "integrated_new" as input:
+
+## Change of Astrocytic pehnotypes:
+## Focus on astrocytes:
+
+```{r}
+
+aa = integrated_new[[]] %>% as.data.frame() %>% filter(celtype_level1=="Astrocytes") %>% rownames()
+astrocytes = subset(integrated_new, cells=aa)
+
+
+## First Differentially gene expression:
+library(Seurat)
+Idents(astrocytes) <- astrocytes$type
+diff_gene <- Seurat::FindAllMarkers(astrocytes, only.pos = T)
+
+## Store DE:
+write.csv(diff_gene, "pathManuscript/Tables/DE_Astrocytes.csv")
+
+
+top <- 
+  diff_gene %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 30) %>%
+    ungroup()
+
+plot_df <- 
+  diff_gene %>% 
+  mutate(sig = ifelse(p_val_adj<0.01, "Yes", "No")) %>% 
+  mutate(log2FC = ifelse(cluster=="KO", avg_log2FC, -avg_log2FC))
+  
+  ggplot(plot_df)+
+  geom_point(mapping=aes(x=log2FC, y=-log10(p_val_adj), fill=sig),size=3,shape=21)+
+  scale_fill_manual(values=pycolors[[1]])+
+  geom_text(data = top %>% filter(cluster=="KO"), 
+            mapping = aes(x=avg_log2FC, y=-log10(p_val_adj), label = gene) )+
+    geom_text(data = top %>% filter(cluster!="KO"), 
+            mapping = aes(x=-avg_log2FC, y=-log10(p_val_adj), label = gene) )+
+    theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+  
+
+
+p = 
+  DoHeatmap(astrocytes, features = top$gene, assay = "RNA", slot="data") + 
+  NoLegend()
+col=colorRampPalette(c("#FFFFFF",RColorBrewer::brewer.pal(9, "Greens")))
+
+
+p$data %>% 
+  na.omit() %>% 
+  group_by(Feature, Identity) %>% 
+  summarise(Expression_mean = mean(Expression)) %>% 
+  ggplot(mapping=aes(x=Feature, y=Identity, size=Expression_mean, fill=Expression_mean))+
+  geom_tile()+
+  scale_fill_gradientn(colours = col(50), name="", 
+                        #limits = c(1,4),
+                        oob=scales::squish)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+```
+
+## Gene Set Enrichment analysis:
+
+```{r}
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+
+
+out_kME <- data.frame(SYMBOL = plot_df$gene,
+                      kME = plot_df$log2FC)
+
+out_genes <- bitr(out_kME$SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+out_kME <- left_join(out_kME,out_genes)
+out_kME <- out_kME %>% filter(!is.na(ENTREZID)) %>% arrange(desc(kME))
+
+values = out_kME$kME;names(values) <- out_kME$ENTREZID
+GSEA <- clusterProfiler::gseKEGG(values)
+GSEAGo <- clusterProfiler::gseGO(values,ont="ALL", keyType = "ENTREZID",OrgDb = "org.Hs.eg.db")
+
+enrichplot::dotplot(GSEAGo, showCategory=10)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+GSEA_data = GSEAGo@result
+
+write.csv(GSEA_data, "pathManuscript/Tables/GSEA_Astrocytes.csv")
+
+```
+
+
+## Astrocyte Subtype:
+```{r}
+AstroSig <- read.csv("pathSingleCell/AstroSig.csv", sep=";")
+
+geneSet = map(unique(AstroSig$ont),~AstroSig[AstroSig$ont==.x, "gene"])
+names(geneSet) <- unique(AstroSig$ont)
+
+astrocytes <- Seurat::AddModuleScore(astrocytes, geneSet, name="Astro")
+
+plot_diff <- 
+  astrocytes@meta.data %>% 
+  as.data.frame() %>% 
+  select(type, paste0("Astro", 1:4)) %>% 
+  mutate(Astro_diff = Astro1-Astro2,
+         maturation = Astro3-Astro4)
+
+mean = 
+  plot_diff %>% 
+  group_by(type) %>% 
+  summarise(mean_diff = mean(Astro_diff),
+            mean_maturation = mean(maturation))
+
+
+
+ggplot()+
+  geom_point(data = plot_diff, mapping=aes(x=Astro_diff, y=maturation, fill=type), shape=21, alpha=0.8)+
+  #geom_point(data = mean, mapping=aes(x=mean_diff, y=mean_maturation), fill="black" ,size=5, shape=21)+
+  scale_fill_manual(values=py$tab10_hex_colors[c(1,2)])+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+```
+
+
+```{r}
+
+astrocytes <- 
+  astrocytes %>% 
+  RunPCA() %>% 
+  RunUMAP(reduction="pca", dims=1:20) %>% 
+  Seurat::FindNeighbors() %>% 
+  FindClusters(resolution = 0.1)
+
+Idents(astrocytes) <- astrocytes$type 
+
+DimPlot(astrocytes, group.by="type")+
+  scale_color_manual(values=py$tab10_hex_colors)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+p = FeaturePlot(astrocytes, features = "TOP2A")+
+  #scale_color_manual(values=py$tab10_hex_colors[c(1,2)])+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+
+plot_diff <- 
+  astrocytes@meta.data %>% 
+  as.data.frame() %>% 
+  select(type, paste0("Astro", 1:4)) %>% 
+  mutate(Astro_diff = Astro1-Astro2,
+         maturation = Astro3-Astro4) %>% 
+  rownames_to_column("cells") %>% 
+  left_join(., p$data %>% rownames_to_column("cells"))
+
+ggplot()+
+  geom_point(data = plot_diff %>% arrange(TOP2A), mapping=aes(x=Astro_diff, y=maturation, fill=TOP2A), shape=21, alpha=0.8)+
+  #scale_fill_manual(values=py$tab10_hex_colors[c(1,2)])+
+  scale_fill_gradientn(colors=viridis::inferno(50))+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+
+```
+
+
+
+
+
+
+
+
+## Cell Communication analysis:
+
+
+
+## Cell Chat Analysis:
+
+```{r}
+library(CellChat)
+library(patchwork)
+library(Seurat)
+library(tidyverse)
+options(stringsAsFactors = FALSE)
+ds$cell_type <- ds$predicted.subclass
+object.list <- map(Seurat::SplitObject(ds, split.by="condition"), .f=function(.x){
+  
+cellchat <- createCellChat(object =.x , group.by = "cell_type")
+cellchat <- setIdent(cellchat, ident.use = "cell_type") 
+levels(cellchat@idents) 
+groupSize <- as.numeric(table(cellchat@idents))
+CellChatDB <- CellChatDB.mouse 
+cellchat@DB <- CellChatDB
+cellchat <- subsetData(cellchat)
+
+future::plan("multisession", workers = 4) 
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- projectData(cellchat, PPI.human)
+cellchat <- computeCommunProb(cellchat, type = "triMean")
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+return(cellchat)
+})
+names(object.list)=c("Ctr","HMOX-KO","Hit HMOX-KO","Hit" )
+
+```
+
+
+## Merge Object
+```{r}
+
+cellchat <- CellChat::mergeCellChat(object.list)
+
+gg1 <- netVisual_heatmap(cellchat)
+#> Do heatmap based on a merged object
+gg2 <- netVisual_heatmap(cellchat, measure = "weight")
+#> Do heatmap based on a merged object
+gg1 + gg2
+```
+
+```{r}
+
+
+num.link <- sapply(object.list, function(x) {rowSums(x@net$count) + colSums(x@net$count)-diag(x@net$count)})
+weight.MinMax <- c(min(num.link), max(num.link)) # control the dot size in the different datasets
+
+object.list <- map(object.list, ~netAnalysis_computeCentrality(.x))
+gg <- list()
+for (i in 1:length(object.list)) {
+  gg[[i]] <- netAnalysis_signalingRole_scatter(object.list[[i]], 
+                                               title = names(object.list)[i], 
+                                               weight.MinMax = weight.MinMax)
+}
+patchwork::wrap_plots(plots = gg)
+```
+
+
+```{r}
+ptm = Sys.time()
+
+cellchat <- computeNetSimilarityPairwise(cellchat, type = "functional")
+cellchat <- netEmbedding(cellchat, type = "functional")
+future::plan("multisession", workers = 4) 
+cellchat <- netClustering(cellchat, type = "functional", do.parallel = F)
+netVisual_embeddingPairwise(cellchat, type = "functional", label.size = 3.5)
+
+```
+
+
+
+
+```{r}
+
+cellchat_sub <- object.list[[4]]
+names(object.list)
+ptm = Sys.time()
+groupSize <- as.numeric(table(cellchat_sub@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat_sub@net$count, 
+                 vertex.weight = groupSize, 
+                 weight.scale = T, 
+                 label.edge= F, 
+                 title.name = "Number of interactions")
+
+
+netVisual_circle(cellchat_sub@net$weight, 
+                 vertex.weight = groupSize, 
+                 weight.scale = T, 
+                 label.edge= F, 
+                 title.name = "Interaction weights/strength")
+
+
+```
+
+
+```{r}
+mat <- cellchat_sub@net$weight
+par(mfrow = c(2,2), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+```
+
+```{r}
+# Heatmap
+pathways.show <- c("CXCL")
+par(mfrow=c(1,1))
+#netVisual_heatmap(cellchat)
+netVisual_heatmap(cellchat, signaling = pathways.show)
+
+```
+
+```{r}
+# show all the significant interactions (L-R pairs) from some cell groups (defined by 'sources.use') to other cell groups (defined by 'targets.use')
+netVisual_bubble(cellchat, sources.use = 1, targets.use = c(5:11), remove.isolate = FALSE)
+```
+
+
+## Differences in T cells:
+
+
+```{r}
+
+tt = integrated_new[[]] %>% as.data.frame() %>% filter(celtype_level1=="T_cells") %>% rownames()
+T_cells = subset(integrated_new, cells=tt)
+
+T_cells <- 
+  T_cells %>% 
+  RunPCA() %>% 
+  RunUMAP(reduction="pca", dims=1:10) %>% 
+  Seurat::FindNeighbors() %>% 
+  FindClusters(resolution = 0.1)
+
+Idents(T_cells) <- T_cells$type 
+
+DimPlot(T_cells, group.by="seurat_clusters", pt.size = 1.5)+
+  scale_color_manual(values=py$tab10_hex_colors)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+anno = T_cells[[]] %>% select(seurat_clusters, annotation_level_4) %>% group_by(seurat_clusters, annotation_level_4) %>% dplyr::count()
+FeaturePlot(T_cells, "CD8A")
+FeaturePlot(T_cells, "TRDV2")
+
+#0=CD4_rest 1 = CD8_EM 2=CD8_cytotoxic 
+
+
+## T cell marker
+library(Seurat)
+Idents(T_cells) <- T_cells$seurat_clusters
+diff_gene <- Seurat::FindAllMarkers(T_cells, only.pos = T)
+top <- 
+  diff_gene %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 10) %>%
+    ungroup()
+write.csv(diff_gene, "pathManuscript/Tables/DE_Tcells.csv")
+
+
+
+## First Differentially gene expression:
+library(Seurat)
+Idents(T_cells) <- T_cells$type
+diff_gene <- Seurat::FindAllMarkers(T_cells, only.pos = T)
+write.csv(diff_gene, "pathManuscript/Tables/DE_Tcells_Groups.csv")
+top <- 
+  diff_gene %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 30) %>%
+    ungroup()
+
+plot_df <- 
+  diff_gene %>% 
+  mutate(sig = ifelse(p_val_adj<0.01, "Yes", "No")) %>% 
+  mutate(log2FC = ifelse(cluster=="KO", avg_log2FC, -avg_log2FC))
+
+library(ggrepel)
+ggplot(plot_df)+
+  geom_point(mapping=aes(x=log2FC, y=-log10(p_val_adj), fill=sig),size=3,shape=21)+
+  scale_fill_manual(values=pycolors[[1]])+
+  geom_text_repel(data = top %>% filter(cluster=="KO"), 
+            mapping = aes(x=avg_log2FC, y=-log10(p_val_adj), label = gene) )+
+    geom_text_repel(data = top %>% filter(cluster!="KO"), 
+            mapping = aes(x=-avg_log2FC, y=-log10(p_val_adj), label = gene) )+
+    theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+  
+
+
+p = 
+  DoHeatmap(astrocytes, features = top$gene, assay = "RNA", slot="data") + 
+  NoLegend()
+col=colorRampPalette(c("#FFFFFF",RColorBrewer::brewer.pal(9, "Greens")))
+
+
+p$data %>% 
+  na.omit() %>% 
+  group_by(Feature, Identity) %>% 
+  summarise(Expression_mean = mean(Expression)) %>% 
+  ggplot(mapping=aes(x=Feature, y=Identity, size=Expression_mean, fill=Expression_mean))+
+  geom_tile()+
+  scale_fill_gradientn(colours = col(50), name="", 
+                        #limits = c(1,4),
+                        oob=scales::squish)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+```
+
+## Gene Set Enrichment analysis:
+
+```{r}
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+
+
+out_kME <- data.frame(SYMBOL = plot_df$gene,
+                      kME = plot_df$log2FC)
+out_genes <- bitr(out_kME$SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+out_kME <- left_join(out_kME,out_genes)
+  out_kME <- out_kME %>% filter(!is.na(ENTREZID)) %>% arrange(desc(kME))
+values = out_kME$kME;names(values) <- out_kME$ENTREZID
+GSEA <- clusterProfiler::gseKEGG(values)
+GSEAGo <- clusterProfiler::gseGO(values,ont="ALL", keyType = "ENTREZID",OrgDb = "org.Hs.eg.db")
+
+enrichplot::dotplot(GSEAGo, showCategory=20)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+GSEA_data = GSEAGo@result
+view(GSEA_data)
+write.csv(GSEA_data, "pathManuscript/Tables/GSEA_Tcells.csv")
+
+```
+
+
+```{r}
+plot_df <- T_cells@meta.data %>% as.data.frame() %>% 
+  group_by(type, seurat_clusters) %>% 
+  summarize(n=length(seurat_clusters))
+
+ggplot(plot_df)+
+  geom_col(mapping=aes(x=seurat_clusters, y=n, fill=type),
+           #position = "fill"
+           )+
+  theme_bw() +
+  scale_fill_manual(values=py$tab10_hex_colors[c(1,2)])+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+```
+
+
+## Myeloid Cells: 
+
+```{r}
+
+cell_types_select <- colors %>% filter(celtype_level1 %in% c("Micoglia", "Macrophages")) %>% pull(celtype_level2)
+
+selected_cells = 
+  integrated_new[[]] %>% 
+  as.data.frame() %>% 
+  filter(celtype_level1 %in% cell_types_select ) %>% rownames()
+
+myeloid = subset(integrated_new, cells=selected_cells)
+
+myeloid <- 
+  myeloid %>% 
+  RunPCA() %>% 
+  RunUMAP(reduction="pca", dims=1:30) %>% 
+  Seurat::FindNeighbors() %>% 
+  FindClusters(resolution = 0.6)
+
+
+DimPlot(myeloid,reduction ="umap",  group.by="seurat_clusters", pt.size = 3.5, label = T, raster=T, raster.dpi = c(1512, 1512))+
+  scale_color_manual(values=py$tab20_hex_colors)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+DimPlot(myeloid,reduction ="umap",  group.by="type", pt.size = 3.5, raster=T, raster.dpi = c(1512, 1512))+
+  scale_color_manual(values=py$tab10_hex_colors)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+
+
+
+plot <-  DimPlot(myeloid,reduction = "umap", group.by = "celtype_level1", label=T,pt.size=5, raster=T, raster.dpi = c(1512, 1512))
+background <- ggBackground(plot, myeloid, reduction = "umap", size=c(3,2))
+
+ggplot(plot$data)+
+  background[[1]]$layers[[3]]+
+  background[[1]]$layers[[4]]+
+  plot[[1]]$layers[[1]]+
+   plot[[1]]$layers[[2]]+
+  scale_color_manual(values=cc)+
+  Seurat::NoLegend()+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 0, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+anno = 
+  myeloid[[]] %>% select(seurat_clusters, annotation_level_4) %>% 
+  group_by(seurat_clusters, annotation_level_4) %>% 
+  dplyr::count()
+view(anno)
+
+
+
+Idents(myeloid) <- myeloid$seurat_clusters
+diff_gene <- Seurat::FindAllMarkers(myeloid, only.pos = T)
+
+write.csv(diff_gene, "pathManuscript/Tables/DE_myeloid.csv")
+top_marker <- 
+  diff_gene %>% 
+  group_by(cluster) %>% 
+  top_n(n=20, wt=avg_log2FC) %>% 
+  filter(cluster %in% c(0,10))
+
+
+p=Seurat::DotPlot(myeloid, features = top_marker$gene %>% unique() , group.by = "seurat_clusters")+
+  scale_color_gradientn(colors=viridis::inferno(50))+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black",
+                                     angle = 90, vjust = 0.5, hjust=0.5 ,size=5), 
+          axis.text.y = element_text(colour="black", size=5))
+  
+p$data %>% 
+  filter(id %in% c(0,10)) %>% 
+  ggplot()+
+  geom_tile(mapping=aes(x=id, y=features.plot, fill=avg.exp.scaled), shape=21)+
+  scale_fill_gradientn(colors=viridis::inferno(50), 
+                       #limits=c(0.3,1), 
+                       oob=scales::squish)+
+  #scale_x_discrete(limits = c(paste0("K_", 1:12)))+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black",
+                                     angle = 90, vjust = 0.5, hjust=0.5 ,size=5), 
+          axis.text.y = element_text(colour="black", size=5))
+
+
+
+
+
+
+
+## run diff gene expression in every group:
+
+list_diffExp <- map(c(0,1,2), .f=function(.x){
+    
+  intermediate_sub = subset(myeloid, cells = myeloid[[]] %>% as.data.frame() %>% filter(seurat_clusters==.x) %>% rownames() )
+  Idents(intermediate_sub) <- intermediate_sub$type
+  diff_gene <- Seurat::FindAllMarkers(intermediate_sub, only.pos = T)
+  return(diff_gene)
+})
+
+
+
+## plot volcano plot
+plotVolcano <- function(diff_gene, nrtop = 30){
+  top <- 
+  diff_gene %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = nrtop) %>%
+    ungroup()
+
+plot_df <- 
+  diff_gene %>% 
+  mutate(sig = ifelse(p_val_adj<0.01, "Yes", "No")) %>% 
+  mutate(log2FC = ifelse(cluster=="KO", avg_log2FC, -avg_log2FC))
+
+library(ggrepel)
+ggplot(plot_df)+
+  geom_point(mapping=aes(x=log2FC, y=-log10(p_val_adj), fill=sig),size=3,shape=21)+
+  scale_fill_manual(values=pycolors[[1]])+
+  geom_text_repel(data = top %>% filter(cluster=="KO"), 
+            mapping = aes(x=avg_log2FC, y=-log10(p_val_adj), label = gene) )+
+    geom_text_repel(data = top %>% filter(cluster!="KO"), 
+            mapping = aes(x=-avg_log2FC, y=-log10(p_val_adj), label = gene) )+
+    theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+}
+
+plotVolcano(list_diffExp[[1]])
+plotVolcano(list_diffExp[[2]])
+plotVolcano(list_diffExp[[3]])
+
+
+```
+
+## Gene Set Enrichment analysis:
+
+```{r}
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+
+plot_df <- 
+  list_diffExp[[1]] %>% 
+  mutate(sig = ifelse(p_val_adj<0.01, "Yes", "No")) %>% 
+  mutate(log2FC = ifelse(cluster=="KO", avg_log2FC, -avg_log2FC)) %>% 
+  filter(p_val_adj<0.0001)
+
+view(plot_df)
+
+out_kME <- data.frame(SYMBOL = plot_df$gene,
+                      kME = plot_df$log2FC)
+
+out_genes <- bitr(out_kME$SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Hs.eg.db")
+out_kME <- left_join(out_kME,out_genes)
+  out_kME <- out_kME %>% filter(!is.na(ENTREZID)) %>% arrange(desc(kME))
+values = out_kME$kME;names(values) <- out_kME$ENTREZID
+#GSEA <- clusterProfiler::gseKEGG(values)
+GSEAGo <- clusterProfiler::gseGO(values,ont="ALL", keyType = "ENTREZID",OrgDb = "org.Hs.eg.db")
+
+enrichplot::dotplot(GSEAGo, showCategory=10)+
+  theme_bw()+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+GSEA_data = GSEAGo@result
+view(GSEA_data)
+write.csv(GSEA_data, "pathManuscript/Tables/GSEA_myeloid.csv")
+```
+
+## Microglia states
+```{r}
+intermediate_sub = subset(myeloid, cells = myeloid[[]] %>% as.data.frame() %>% filter(seurat_clusters==0) %>% rownames() )
+Idents(intermediate_sub) <- intermediate_sub$type
+
+
+
+plot_df <- intermediate_sub@meta.data %>% as.data.frame() %>% 
+  group_by(type, annotation_level_4) %>% 
+  summarize(n=length(annotation_level_4))
+
+ggplot(plot_df)+
+  geom_col(mapping=aes(x=annotation_level_4, y=n, fill=type),
+           #position = "fill"
+           )+
+  theme_bw() +
+  scale_fill_manual(values=py$tab10_hex_colors[c(1,2)])+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+```
+
+
+## Microglia states
+```{r}
+intermediate_sub = subset(myeloid, cells = myeloid[[]] %>% as.data.frame() %>% filter(seurat_clusters==1) %>% rownames() )
+Idents(intermediate_sub) <- intermediate_sub$type
+
+
+
+plot_df <- intermediate_sub@meta.data %>% as.data.frame() %>% 
+  group_by(type, annotation_level_4) %>% 
+  summarize(n=length(annotation_level_4))
+
+ggplot(plot_df)+
+  geom_col(mapping=aes(x=annotation_level_4, y=n, fill=type),
+           #position = "fill"
+           )+
+  theme_bw() +
+  scale_fill_manual(values=py$tab10_hex_colors[c(1,2)])+
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+```
+

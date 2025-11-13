@@ -1,0 +1,320 @@
+---
+title: "Analysis AQP4 Single-cell Data"
+date: "2024-09-08"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Use dedicated conda env for single-cell analysis if desired
+# reticulate::use_condaenv("Single_cell")
+
+library(SPATA2)
+library(Seurat)
+library(tidyverse)
+library(readxl)
+library(reticulate)
+
+source("r/setup_spatial_project.R")
+source("r/plotting_utils.R")
+source("r/singlecell_utils.R")
+
+project_root <- get_project_root()
+pycolors <- importPyColors()  # defined in singlecell_utils.R
+```
+
+## Load integrated single-cell data (Python)
+
+```{python}
+import scanpy as sc
+import numpy as np
+from rpy2.robjects import r
+
+project_root = r['project_root'][0]
+
+adata_path = f"{project_root}/data/integrated_data_new.h5ad"
+adata = sc.read_h5ad(adata_path)
+
+latent = adata.obsm["X_umap"]
+bcs = adata.obs.index.to_numpy()
+batch = np.array(adata.obs["batch"])
+full_latent = adata.obsm["X_scVI"]
+latent.shape
+```
+
+## Build Seurat object for KO and WT samples
+
+```{r}
+root_singlecell <- file.path(project_root, "data", "singlecell_raw")
+folder <- c("AQP4KO", "AQP4WT")
+
+KO <- read_10x_batches(file.path(root_singlecell, folder[1]), type_label = "KO")
+WT <- read_10x_batches(file.path(root_singlecell, folder[2]), type_label = "WT")
+
+merged_obj <- KO[[1]]
+for(i in 2:length(KO)) merged_obj <- merge(merged_obj, KO[[i]])
+for(i in 1:length(WT)) merged_obj <- merge(merged_obj, WT[[i]])
+
+merged_obj <- JoinLayers(merged_obj)
+integrated <- merged_obj
+```
+
+## Humanize mouse genes
+
+```{r}
+integrated_new <- humanize_mouse_seurat(integrated)
+```
+
+## Azimuth annotation and integration
+
+```{r}
+az_ref_path   <- file.path(project_root, "data", "azimuth_core_GBmap.rds")
+color_ref_path <- file.path(project_root, "data", "colors_cell_deconv.RDS")
+
+az_result <- run_azimuth_gbmap(
+  integrated_new,
+  az_ref_path    = az_ref_path,
+  color_ref_path = color_ref_path
+)
+
+integrated_new <- az_result$query
+ds.ref         <- az_result$reference
+```
+
+## Harmony integration and clustering
+
+```{r}
+integrated_new <- 
+  integrated_new %>% 
+  Seurat::FindVariableFeatures() %>% 
+  Seurat::NormalizeData() %>% 
+  Seurat::ScaleData() %>% 
+  Seurat::RunPCA()
+
+integrated_new <- harmony::RunHarmony(integrated_new, group.by.vars = "batch")
+
+integrated_new <- 
+  integrated_new %>% 
+  Seurat::FindNeighbors(reduction = "harmony") %>% 
+  Seurat::FindClusters() %>% 
+  Seurat::RunUMAP(reduction = "harmony", dims = 1:30)
+
+DimPlot(integrated_new, reduction = "umap", group.by = "batch") + Seurat::NoLegend()
+DimPlot(integrated_new, reduction = "umap", group.by = "type", raster = TRUE)
+```
+
+## Transfer Azimuth labels and visualize
+
+```{r}
+integrated_new$annotation_level_4 <- ds.ref$predicted.annotation_level_4
+
+gbm_color_path <- file.path(project_root, "data", "GBM_Neuron_colors.RDS")
+colors_ref <- readRDS(gbm_color_path)
+colors_ref$annotation_level_4new <- 
+  colors_ref$annotation_level_4 %>% 
+  str_replace_all(" ", "_") %>% 
+  str_replace_all("-", "_") %>% 
+  str_replace_all("/", "_")
+cc <- colors_ref$colors; names(cc) <- colors_ref$annotation_level_4new
+
+p_type <- DimPlot(integrated_new, reduction = "umap", group.by = "type", raster = TRUE)
+p_anno <- DimPlot(
+  integrated_new, reduction = "umap",
+  group.by = "annotation_level_4", label = TRUE, raster = TRUE
+) + 
+  Seurat::NoLegend() +
+  scale_color_manual(values = cc)
+
+p_type + p_anno
+```
+
+## Manual cell type annotation
+
+```{r}
+anno_new <- build_manual_celltype_annotation()
+integrated_new$celtype_level1 <- NULL
+integrated_new$celtype_level1 <- 
+  integrated_new@meta.data %>% 
+  left_join(anno_new, by = "seurat_clusters") %>% 
+  pull(celtype_level1)
+
+DimPlot(integrated_new, reduction = "umap", group.by = "celtype_level1",
+        label = TRUE, raster = TRUE) + Seurat::NoLegend()
+```
+
+## Cell type proportions
+
+```{r}
+plot_celltype_proportions(integrated_new)
+```
+
+## Save integrated object
+
+```{r}
+saveRDS(
+  integrated_new,
+  file.path(project_root, "results", "integrated_new.RDS")
+)
+```
+
+## Attach scVI latent and UMAP from Python
+
+```{r}
+integrated_new <- readRDS(file.path(project_root, "results", "integrated_new.RDS"))
+
+latent_space <- py$latent
+umap_ls <- latent_space %>% as.matrix()
+colnames(umap_ls) <- c("umap_1", "umap_2")
+
+raw_barcodes <- rownames(integrated_new[[]]) %>%
+  str_split("_") %>% 
+  map(~ .x[[1]]) %>% 
+  unlist()
+merged_barcodes <- paste0(raw_barcodes, "_", integrated_new[[]]$batch)
+
+raw_barcodes_py <- py$bcs %>% 
+  str_split("-") %>% 
+  map(~ paste0(.x[[0]], "-", .x[[1]])) %>% 
+  unlist()
+merged_barcodes_py <- paste0(raw_barcodes_py, "_Batch_", py$batch)
+
+merged <- 
+  data.frame(merged_barcodes = merged_barcodes_py) %>% 
+  left_join(
+    data.frame(IDs = rownames(integrated_new[[]]), merged_barcodes = merged_barcodes),
+    by = "merged_barcodes"
+  )
+
+rownames(umap_ls) <- merged$IDs
+
+scVI_latent <- py$full_latent %>% as.matrix()
+colnames(scVI_latent) <- paste0("SCVI_", 1:ncol(scVI_latent))
+rownames(scVI_latent) <- merged$IDs
+
+scVI <- Seurat::CreateDimReducObject(
+  embeddings = scVI_latent,
+  key = "scVI",
+  assay = "RNA"
+)
+integrated_new@reductions$scVI <- scVI
+
+scVI_umap <- Seurat::CreateDimReducObject(
+  embeddings = umap_ls,
+  key = "scVI_umap",
+  assay = "RNA"
+)
+integrated_new@reductions$scVI_umap <- scVI_umap
+
+DimPlot(integrated_new, reduction = "scVI_umap", group.by = "celtype_level1",
+        label = TRUE, raster = TRUE) + Seurat::NoLegend()
+```
+
+## Attention-based perturbation model (Python)
+
+```{r}
+np <- reticulate::import("numpy")
+exp_mat <- integrated_new@assays$RNA$scale.data
+nn_inp <- np$asarray(exp_mat %>% t())
+labels <- np$asarray(integrated_new$type %>% as.factor() %>% as.numeric())
+```
+
+```{python}
+import torch
+import numpy as np
+from rpy2.robjects import r
+from torch.utils.data import DataLoader
+from python.singlecell_attention import (
+    NeuralNetWithAttention,
+    CustomDataset,
+    train_attention_model,
+)
+
+input_data = r.nn_inp
+treatment_data = r.labels.astype("int64")
+treatment_data -= treatment_data.min()
+
+dataset = CustomDataset(input_data, treatment_data, input_data)
+data_loader = DataLoader(dataset, batch_size=256, shuffle=True)
+
+input_dim = input_data.shape[1]
+attention_dim = 128
+hidden_dim = 256
+output_dim = input_dim
+treatment_classes = int(treatment_data.max() + 1)
+
+model = NeuralNetWithAttention(input_dim, attention_dim, hidden_dim,
+                               output_dim, treatment_classes)
+
+loss_history = train_attention_model(
+    model,
+    data_loader,
+    num_epochs = 50,
+    lr = 1e-3,
+)
+
+loss_list = np.array(loss_history)
+```
+
+## Inspect training loss
+
+```{r}
+ggplot(
+  data = data.frame(y = py$loss_list, x = seq_along(py$loss_list)),
+  aes(x = x, y = y)
+) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("Attention model training loss") +
+  ylab("MAE loss") +
+  xlab("Epochs")
+```
+
+## Predict KO vs WT states and embed
+
+```{python}
+model.eval()
+l = input_data.shape[0]
+
+cond0 = model(
+    torch.tensor(input_data, dtype=torch.float32),
+    torch.tensor(np.zeros(l, dtype=np.int64))
+)[0].detach().numpy()
+
+cond1 = model(
+    torch.tensor(input_data, dtype=torch.float32),
+    torch.tensor(np.ones(l, dtype=np.int64))
+)[0].detach().numpy()
+```
+
+```{r}
+exp0 <- py$cond0 %>% as.matrix() %>% t()
+colnames(exp0) <- paste0("Cell_1_", seq_len(ncol(exp0)))
+rownames(exp0) <- rownames(exp_mat)
+
+exp1 <- py$cond1 %>% as.matrix() %>% t()
+colnames(exp1) <- paste0("Cell_2_", seq_len(ncol(exp1)))
+rownames(exp1) <- rownames(exp_mat)
+
+org_lab <- py$treatment_data
+
+AS_artif <- Seurat::CreateSeuratObject(cbind(exp0, exp1))
+AS_artif@assays$RNA$scale.data <- cbind(exp0, exp1)
+
+AS_artif <- 
+  AS_artif %>% 
+  Seurat::FindVariableFeatures() %>% 
+  Seurat::RunPCA() %>% 
+  Seurat::RunUMAP(dims = 1:15)
+
+AS_artif$p <- as.factor(c(rep(0, py$l), rep(1, py$l)))
+AS_artif$cell_type_new <- c(
+  integrated_new$celtype_level1,
+  integrated_new$celtype_level1
+) %>% as.character()
+AS_artif$celtype_level1 <- AS_artif$cell_type_new
+```
+
+At this point, you can re-use the plotting patterns from the original
+notebook (UMAPs, marker expression, astrocyte-focused DE, GSEA, etc.)
+or move them into helper functions in `r/singlecell_utils.R` as needed.
