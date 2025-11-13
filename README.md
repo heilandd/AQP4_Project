@@ -26,6 +26,7 @@ AQP4_spatial_project/
 
 AQP4_singlecell_project/
 ├─ AQP4_singlecell_analysis.Rmd   # Main R Markdown analysis
+├─ AQP4_singlecell_analysis2.Rmd  # Subgroup Analysis (Myeloid cells Astrocytes)
 ├─ r/
 │  ├─ setup_spatial_project.R     # Project root helper (env-based)
 │  ├─ plotting_utils.R            # ggBackground + plotting helpers
